@@ -3,7 +3,7 @@ Description=Azure Linux Agent
 Wants=systemd-networkd-wait-online.service sshd.service sshd-keygen.service
 After=systemd-networkd-wait-online.service cloud-init.service
 
-ConditionFileIsExecutable=/usr/bin/waagent
+ConditionFileIsExecutable=/usr/sbin/waagent
 ConditionPathExists=/etc/waagent.conf
 
 [Service]
