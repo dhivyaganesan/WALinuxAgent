@@ -19,6 +19,9 @@ import zipfile
 from datetime import datetime, timedelta
 from threading import currentThread
 
+from tests.common.osutil.test_default import TestOSUtil
+import azurelinuxagent.common.osutil.default as osutil
+
 _ORIGINAL_POPEN = subprocess.Popen
 
 from mock import PropertyMock
@@ -28,7 +31,7 @@ from azurelinuxagent.common.event import EVENTS_DIRECTORY
 from azurelinuxagent.common.exception import ProtocolError, UpdateError, ResourceGoneError, HttpError
 from azurelinuxagent.common.future import ustr
 from azurelinuxagent.common.persist_firewall_rules import PersistFirewallRulesHandler
-from azurelinuxagent.common.protocol.goal_state import ExtensionsConfig
+from azurelinuxagent.common.protocol.extensions_goal_state import ExtensionsGoalState
 from azurelinuxagent.common.protocol.hostplugin import URI_FORMAT_GET_API_VERSIONS, HOST_PLUGIN_PORT, \
     URI_FORMAT_GET_EXTENSION_ARTIFACT, HostPluginProtocol
 from azurelinuxagent.common.protocol.restapi import ExtHandlerPackageUri, VMAgentManifest, VMAgentManifestUri, \
@@ -43,7 +46,7 @@ from azurelinuxagent.common.version import AGENT_PKG_GLOB, AGENT_DIR_GLOB, AGENT
 from azurelinuxagent.ga.exthandlers import ExtHandlersHandler, ExtHandlerInstance, HandlerEnvironment, ValidHandlerStatus
 from azurelinuxagent.ga.update import GuestAgent, GuestAgentError, MAX_FAILURE, AGENT_MANIFEST_FILE, \
     get_update_handler, ORPHAN_POLL_INTERVAL, AGENT_PARTITION_FILE, AGENT_ERROR_FILE, ORPHAN_WAIT_INTERVAL, \
-    CHILD_LAUNCH_RESTART_MAX, CHILD_HEALTH_INTERVAL, GOAL_STATE_PERIOD_EXTENSIONS_DISABLED, UpdateHandler, READONLY_FILE_GLOBS
+    CHILD_LAUNCH_RESTART_MAX, CHILD_HEALTH_INTERVAL, GOAL_STATE_PERIOD_EXTENSIONS_DISABLED, UpdateHandler, READONLY_FILE_GLOBS, ExtensionsSummary
 from tests.protocol.mocks import mock_wire_protocol
 from tests.protocol.mockwiredata import DATA_FILE, DATA_FILE_MULTIPLE_EXT
 from tests.tools import AgentTestCase, data_dir, DEFAULT, patch, load_bin_data, load_data, Mock, MagicMock, \
@@ -1111,7 +1114,11 @@ class TestUpdate(UpdateTestCase):
             with patch('time.time', side_effect=mock_time.time):
                 with patch('time.sleep', side_effect=mock_time.sleep):
                     self.update_handler.run_latest(child_args=child_args)
-                    self.assertEqual(1, mock_popen.call_count, "Expected a single call to the latest agent; got: {0}".format(mock_popen.call_args_list))
+                    agent_calls = [args[0] for (args, _) in mock_popen.call_args_list if
+                                   "run-exthandlers" in ''.join(args[0])]
+                    self.assertEqual(1, len(agent_calls),
+                                     "Expected a single call to the latest agent; got: {0}. All mocked calls: {1}".format(
+                                         agent_calls, mock_popen.call_args_list))
 
                     return mock_popen.call_args
 
@@ -1409,10 +1416,10 @@ class TestUpdate(UpdateTestCase):
         self.assertTrue(self._test_upgrade_available())
 
     def test_upgrade_available_handles_missing_family(self):
-        extensions_config = ExtensionsConfig(load_data("wire/ext_conf_missing_family.xml"))
+        extensions_goal_state = ExtensionsGoalState.from_extensions_config(load_data("wire/ext_conf_missing_family.xml"))
         protocol = ProtocolMock()
         protocol.family = "Prod"
-        protocol.agent_manifests = extensions_config.vmagent_manifests  # pylint: disable=attribute-defined-outside-init
+        protocol.agent_manifests = extensions_goal_state.vmagent_manifests  # pylint: disable=attribute-defined-outside-init
         self.update_handler.protocol_util = protocol
         with patch('azurelinuxagent.common.logger.warn') as mock_logger:
             with patch('tests.ga.test_update.ProtocolMock.get_vmagent_pkgs', side_effect=ProtocolError):
@@ -1644,12 +1651,82 @@ class TestUpdate(UpdateTestCase):
                 with patch('azurelinuxagent.common.conf.enable_firewall', return_value=True):
                     update_handler.run(debug=True)
 
-        # Firewall-cmd should only be called 3 times - 1st to check if running, 2nd & 3rd for the QueryPassThrough cmd
-        self.assertEqual(3, len(executed_commands), "The number of times firwall-cmd should be called is only 3")
+        # Firewall-cmd should only be called 4 times - 1st to check if running, 2nd, 3rd & 4th for the QueryPassThrough cmd
+        self.assertEqual(4, len(executed_commands), "The number of times firwall-cmd should be called is only 4")
         self.assertEqual(PersistFirewallRulesHandler._FIREWALLD_RUNNING_CMD, executed_commands.pop(0),
                          "First command should be to check if firewalld is running")
         self.assertTrue([FirewallCmdDirectCommands.QueryPassThrough in cmd for cmd in executed_commands],
                         "The remaining commands should only be for querying the firewall commands")
+
+    def test_it_should_set_dns_tcp_iptable_if_drop_available_accept_unavailable(self):
+        osutil._enable_firewall = True
+
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with self._get_update_handler(test_data=DATA_FILE) as (update_handler, _ ):
+                #drop rule is present
+                mock_iptables.set_command(osutil._get_firewall_drop_command(mock_iptables.wait, "-C", mock_iptables.destination), exit_code=0)
+                # non root tcp iptable rule is absent
+                mock_iptables.set_command(osutil._get_firewall_accept_dns_tcp_request_command(mock_iptables.wait, "-C", mock_iptables.destination), exit_code=1)
+                update_handler.run(debug=True)
+
+                drop_check_command = TestOSUtil._command_to_string(osutil._get_firewall_drop_command(mock_iptables.wait, "-C", mock_iptables.destination))
+                accept_nonroot_tcp_check_command = TestOSUtil._command_to_string(osutil._get_firewall_accept_dns_tcp_request_command(mock_iptables.wait, "-C", mock_iptables.destination))
+                get_firewall_packets_command = TestOSUtil._command_to_string(osutil._get_firewall_accept_dns_tcp_request_command(mock_iptables.wait, "-I", mock_iptables.destination))
+
+                get_firewall_packets = TestOSUtil._command_to_string(osutil._get_firewall_packets_command(mock_iptables.wait))
+
+                self.assertEqual(len(mock_iptables.command_calls), 4,"Incorrect number of calls to iptables: [{0}]".format(mock_iptables.command_calls))
+                self.assertEqual(mock_iptables.command_calls[0], drop_check_command,
+                                 "The first command should check the drop rule")
+                self.assertEqual(mock_iptables.command_calls[1], accept_nonroot_tcp_check_command,
+                                 "The second command should check the accept rule")
+                self.assertEqual(mock_iptables.command_calls[2], get_firewall_packets_command,
+                                 "The third command should add the accept rule")
+                self.assertEqual(mock_iptables.command_calls[3], get_firewall_packets,
+                                 "The fourth command should be for listing the firewall rules")
+
+    def test_it_should_not_set_dns_tcp_iptable_if_drop_unavailable(self):
+        osutil._enable_firewall = True
+
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with self._get_update_handler(test_data=DATA_FILE) as (update_handler, _):
+                #drop rule is not available
+                mock_iptables.set_command(osutil._get_firewall_drop_command(mock_iptables.wait, "-C", mock_iptables.destination), exit_code=1)
+
+                update_handler.run(debug=True)
+
+                drop_check_command = TestOSUtil._command_to_string(osutil._get_firewall_drop_command(mock_iptables.wait, "-C", mock_iptables.destination))
+                get_firewall_packets_command = TestOSUtil._command_to_string(osutil._get_firewall_packets_command(mock_iptables.wait))
+
+                self.assertEqual(len(mock_iptables.command_calls), 2,"Incorrect number of calls to iptables: [{0}]".format(mock_iptables.command_calls))
+                self.assertEqual(mock_iptables.command_calls[0], drop_check_command,
+                                 "The first command should check the drop rule")
+                self.assertEqual(mock_iptables.command_calls[1], get_firewall_packets_command,
+                                 "The fourth command should be for listing the firewall rules")
+
+    def test_it_should_not_set_dns_tcp_iptable_if_drop_and_accept_available(self):
+        osutil._enable_firewall = True
+
+        with TestOSUtil._mock_iptables() as mock_iptables:
+            with self._get_update_handler(test_data=DATA_FILE) as (update_handler, _):
+                #drop rule is available
+                mock_iptables.set_command(osutil._get_firewall_drop_command(mock_iptables.wait, "-C", mock_iptables.destination), exit_code=0)
+                # non root tcp iptable rule is available
+                mock_iptables.set_command(osutil._get_firewall_accept_dns_tcp_request_command(mock_iptables.wait, "-C", mock_iptables.destination), exit_code=0)
+
+                update_handler.run(debug=True)
+
+                drop_check_command = TestOSUtil._command_to_string(osutil._get_firewall_drop_command(mock_iptables.wait, "-C", mock_iptables.destination))
+                get_firewall_packets_command = TestOSUtil._command_to_string(osutil._get_firewall_packets_command(mock_iptables.wait))
+                accept_nonroot_tcp_check_command = TestOSUtil._command_to_string(osutil._get_firewall_accept_dns_tcp_request_command(mock_iptables.wait, "-C", mock_iptables.destination))
+
+                self.assertEqual(len(mock_iptables.command_calls), 3,"Incorrect number of calls to iptables: [{0}]".format(mock_iptables.command_calls))
+                self.assertEqual(mock_iptables.command_calls[0], drop_check_command,
+                                 "The first command should check the drop rule")
+                self.assertEqual(mock_iptables.command_calls[1], accept_nonroot_tcp_check_command,
+                                 "The second command should check the accept rule")
+                self.assertEqual(mock_iptables.command_calls[2], get_firewall_packets_command,
+                                 "The fourth command should be for listing the firewall rules")
 
 
     @contextlib.contextmanager
@@ -1685,10 +1762,23 @@ class TestUpdate(UpdateTestCase):
     def test_it_should_retain_extension_events_directories_if_extension_telemetry_pipeline_enabled(self):
         # Rerun update handler again with extension telemetry pipeline enabled to ensure we dont delete events directories
         with self._setup_test_for_ext_event_dirs_retention() as (update_handler, expected_events_dirs):
+            self._add_write_permission_to_goal_state_files()
             update_handler.run(debug=True)
             for ext_dir in expected_events_dirs:
                 self.assertTrue(os.path.exists(ext_dir), "Extension directory {0} should exist!".format(ext_dir))
 
+    def test_it_should_recreate_extension_event_directories_for_existing_extensions_if_extension_telemetry_pipeline_enabled(self):
+        with self._setup_test_for_ext_event_dirs_retention() as (update_handler, expected_events_dirs):
+            # Delete existing events directory
+            for ext_dir in expected_events_dirs:
+                shutil.rmtree(ext_dir, ignore_errors=True)
+                self.assertFalse(os.path.exists(ext_dir), "Extension directory not deleted")
+
+            with patch("azurelinuxagent.common.agent_supported_feature._ETPFeature.is_supported", True):
+                self._add_write_permission_to_goal_state_files()
+                update_handler.run(debug=True)
+                for ext_dir in expected_events_dirs:
+                    self.assertTrue(os.path.exists(ext_dir), "Extension directory {0} should exist!".format(ext_dir))
 
 @patch('azurelinuxagent.ga.update.get_collect_telemetry_events_handler')
 @patch('azurelinuxagent.ga.update.get_send_telemetry_events_handler')
@@ -2178,6 +2268,54 @@ class GoalStateIntervalTestCase(AgentTestCase):
                     exthandlers_handler.protocol.mock_wire_data.set_incarnation(100)
                     update_handler._process_goal_state(exthandlers_handler, remote_access_handler)
                     self.assertEqual(goal_state_period, update_handler._goal_state_period, "Expected the regular goal state period when the goal state does not converge")
+
+
+class ExtensionsSummaryTestCase(AgentTestCase):
+    @staticmethod
+    def _create_extensions_summary(extension_statuses):
+        """
+        Creates an ExtensionsSummary from an array of (extension name, extension status) tuples
+        """
+        vm_status = VMStatus(status="Ready", message="Ready")
+        vm_status.vmAgent.extensionHandlers = [ExtHandlerStatus()] * len(extension_statuses)
+        for i in range(len(extension_statuses)):
+            vm_status.vmAgent.extensionHandlers[i].extension_status = ExtensionStatus(name=extension_statuses[i][0])
+            vm_status.vmAgent.extensionHandlers[0].extension_status.status = extension_statuses[i][1]
+        return ExtensionsSummary(vm_status)
+
+    def test_equality_operator_should_return_true_on_items_with_the_same_value(self):
+        summary1 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success), ("Extension 2", ValidHandlerStatus.transitioning)])
+        summary2 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success), ("Extension 2", ValidHandlerStatus.transitioning)])
+
+        self.assertTrue(summary1 == summary2, "{0} == {1} should be True".format(summary1, summary2))
+
+    def test_equality_operator_should_return_false_on_items_with_different_values(self):
+        summary1 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success), ("Extension 2", ValidHandlerStatus.transitioning)])
+        summary2 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success), ("Extension 2", ValidHandlerStatus.success)])
+
+        self.assertFalse(summary1 == summary2, "{0} == {1} should be False")
+
+        summary1 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success)])
+        summary2 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success), ("Extension 2", ValidHandlerStatus.success)])
+
+        self.assertFalse(summary1 == summary2, "{0} == {1} should be False")
+
+    def test_inequality_operator_should_return_true_on_items_with_different_values(self):
+        summary1 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success), ("Extension 2", ValidHandlerStatus.transitioning)])
+        summary2 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success), ("Extension 2", ValidHandlerStatus.success)])
+
+        self.assertTrue(summary1 != summary2, "{0} != {1} should be True".format(summary1, summary2))
+
+        summary1 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success)])
+        summary2 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success), ("Extension 2", ValidHandlerStatus.success)])
+
+        self.assertTrue(summary1 != summary2, "{0} != {1} should be True")
+
+    def test_inequality_operator_should_return_false_on_items_with_same_value(self):
+        summary1 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success), ("Extension 2", ValidHandlerStatus.transitioning)])
+        summary2 = ExtensionsSummaryTestCase._create_extensions_summary([("Extension 1", ValidHandlerStatus.success), ("Extension 2", ValidHandlerStatus.transitioning)])
+
+        self.assertFalse(summary1 != summary2, "{0} != {1} should be False".format(summary1, summary2))
 
 
 if __name__ == '__main__':

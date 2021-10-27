@@ -32,12 +32,15 @@ import zipfile
 
 from datetime import datetime, timedelta
 
+from azurelinuxagent.common.utils import shellutil
+
 import azurelinuxagent.common.conf as conf
 import azurelinuxagent.common.logger as logger
 import azurelinuxagent.common.utils.fileutil as fileutil
 import azurelinuxagent.common.utils.restutil as restutil
 import azurelinuxagent.common.utils.textutil as textutil
 from azurelinuxagent.common.agent_supported_feature import get_supported_feature_by_name, SupportedFeatureNames
+from azurelinuxagent.common.osutil.default import _get_firewall_drop_command, _get_firewall_accept_dns_tcp_request_command
 from azurelinuxagent.common.persist_firewall_rules import PersistFirewallRulesHandler
 from azurelinuxagent.common.cgroupconfigurator import CGroupConfigurator
 
@@ -56,7 +59,7 @@ from azurelinuxagent.ga.collect_logs import get_collect_logs_handler, is_log_col
 from azurelinuxagent.ga.env import get_env_handler
 from azurelinuxagent.ga.collect_telemetry_events import get_collect_telemetry_events_handler
 
-from azurelinuxagent.ga.exthandlers import HandlerManifest, ExtHandlersHandler, list_agent_lib_directory, ValidHandlerStatus
+from azurelinuxagent.ga.exthandlers import HandlerManifest, ExtHandlersHandler, list_agent_lib_directory, ValidHandlerStatus, HandlerStatus
 from azurelinuxagent.ga.monitor import get_monitor_handler
 
 from azurelinuxagent.ga.send_telemetry_events import get_send_telemetry_events_handler
@@ -105,12 +108,16 @@ class ExtensionsSummary(object):
             self.summary = []
             self.converged = True
         else:
-            self.summary = [(h.extension_status.name, h.extension_status.status) for h in vm_status.vmAgent.extensionHandlers]
+            # take the name and status of the extension if is it not None, else use the handler's
+            self.summary = [(o.name, o.status) for o in map(lambda h: h.extension_status if h.extension_status is not None else h, vm_status.vmAgent.extensionHandlers)]
             self.summary.sort(key=lambda s: s[0])  # sort by extension name to make comparisons easier
-            self.converged = all(status in (ValidHandlerStatus.success, ValidHandlerStatus.error) for _, status in self.summary)
+            self.converged = all(status in (ValidHandlerStatus.success, ValidHandlerStatus.error, HandlerStatus.ready, HandlerStatus.not_ready) for _, status in self.summary)
 
     def __eq__(self, other):
         return self.summary == other.summary
+
+    def __ne__(self, other):
+        return not (self.summary == other.summary)
 
     def __str__(self):
         return ustr(self.summary)
@@ -342,6 +349,7 @@ class UpdateHandler(object):
             self._ensure_cgroups_initialized()
             self._ensure_extension_telemetry_state_configured_properly(protocol)
             self._ensure_firewall_rules_persisted(dst_ip=protocol.get_endpoint())
+            self._add_dns_tcp_firewall_rule_if_not_enabled(dst_ip=protocol.get_endpoint())
 
             # Get all thread handlers
             telemetry_handler = get_send_telemetry_events_handler(self.protocol_util)
@@ -916,6 +924,7 @@ class UpdateHandler(object):
 
     @staticmethod
     def _ensure_extension_telemetry_state_configured_properly(protocol):
+        etp_enabled = get_supported_feature_by_name(SupportedFeatureNames.ExtensionTelemetryPipeline).is_supported
         for name, path in list_agent_lib_directory(skip_agent_package=True):
 
             try:
@@ -932,13 +941,17 @@ class UpdateHandler(object):
                     # This is to ensure that existing extensions can start using the telemetry pipeline if they support
                     # it and also ensures that the extensions are not sending out telemetry if the Agent has to disable the feature.
                     handler_instance.create_handler_env()
+                    events_dir = handler_instance.get_extension_events_dir()
+                    # If ETP is enabled and events directory doesn't exist for handler, create it
+                    if etp_enabled and not(os.path.exists(events_dir)):
+                        fileutil.mkdir(events_dir, mode=0o700)
             except Exception as e:
                 logger.warn(
                     "Unable to re-create HandlerEnvironment file on service startup. Error: {0}".format(ustr(e)))
                 continue
 
         try:
-            if not get_supported_feature_by_name(SupportedFeatureNames.ExtensionTelemetryPipeline).is_supported:
+            if not etp_enabled:
                 # If extension telemetry pipeline is disabled, ensure we delete all existing extension events directory
                 # because the agent will not be listening on those events.
                 extension_event_dirs = glob.glob(os.path.join(conf.get_ext_log_dir(), "*", EVENTS_DIRECTORY))
@@ -970,6 +983,34 @@ class UpdateHandler(object):
             is_success=is_success,
             message=msg,
             log_event=False)
+
+    @staticmethod
+    def _add_dns_tcp_firewall_rule_if_not_enabled(dst_ip):
+
+        # Helper to execute a run command, returns True if no exception else returns False
+        def _execute_run_command(command):
+            try:
+                shellutil.run_command(command)
+                return True
+            except Exception:
+                return False
+
+        # "-C" checks if the iptable rule is available in the chain. It throws an exception if the ip table rule doesnt exist
+        drop_rule = _get_firewall_drop_command("-w", "-C", dst_ip)
+        if not _execute_run_command(drop_rule):
+            return
+        else:
+            accept_non_root = _get_firewall_accept_dns_tcp_request_command("-w", "-C", dst_ip)
+            if not _execute_run_command(accept_non_root):
+                try:
+                    logger.info("Firewall rule to allow DNS TCP request to wireserver for a non root user unavailable . Setting it now.")
+                    accept_non_root = _get_firewall_accept_dns_tcp_request_command("-w", "-I", dst_ip)
+                    shellutil.run_command(accept_non_root)
+                    logger.info("Succesfully added firewall rule to allow non root users to do a DNS TCP request to wireserver ")
+                except Exception as e:
+                    msg = "Unable to set the nonroot tcp access firewall rule:{0}".format(ustr(e))
+                    logger.error(msg)
+
 
 
 class GuestAgent(object):
