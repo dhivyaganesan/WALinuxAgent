@@ -59,7 +59,7 @@ from azurelinuxagent.ga.collect_logs import get_collect_logs_handler, is_log_col
 from azurelinuxagent.ga.env import get_env_handler
 from azurelinuxagent.ga.collect_telemetry_events import get_collect_telemetry_events_handler
 
-from azurelinuxagent.ga.exthandlers import HandlerManifest, ExtHandlersHandler, list_agent_lib_directory, ValidHandlerStatus, HandlerStatus
+from azurelinuxagent.ga.exthandlers import HandlerManifest, ExtHandlersHandler, list_agent_lib_directory, ExtensionStatusValue, ExtHandlerStatusValue
 from azurelinuxagent.ga.monitor import get_monitor_handler
 
 from azurelinuxagent.ga.send_telemetry_events import get_send_telemetry_events_handler
@@ -111,13 +111,13 @@ class ExtensionsSummary(object):
             # take the name and status of the extension if is it not None, else use the handler's
             self.summary = [(o.name, o.status) for o in map(lambda h: h.extension_status if h.extension_status is not None else h, vm_status.vmAgent.extensionHandlers)]
             self.summary.sort(key=lambda s: s[0])  # sort by extension name to make comparisons easier
-            self.converged = all(status in (ValidHandlerStatus.success, ValidHandlerStatus.error, HandlerStatus.ready, HandlerStatus.not_ready) for _, status in self.summary)
+            self.converged = all(status in (ExtensionStatusValue.success, ExtensionStatusValue.error, ExtHandlerStatusValue.ready, ExtHandlerStatusValue.not_ready) for _, status in self.summary)
 
     def __eq__(self, other):
         return self.summary == other.summary
 
     def __ne__(self, other):
-        return not (self.summary == other.summary)
+        return not (self == other)
 
     def __str__(self):
         return ustr(self.summary)
@@ -430,6 +430,8 @@ class UpdateHandler(object):
         protocol = exthandlers_handler.protocol
         if not self._try_update_goal_state(protocol):
             self._heartbeat_update_goal_state_error_count += 1
+            # We should have a cached goal state here, go ahead and report status for that.
+            self._report_status(exthandlers_handler, incarnation_changed=False)
             return
 
         if self._upgrade_available(protocol):
@@ -575,9 +577,13 @@ class UpdateHandler(object):
                 "Changing this value affects how often extensions are processed and status for the VM is reported. Too small a value may report the VM as unresponsive")
             log_if_op_disabled("OS.EnableFirewall", conf.enable_firewall())
             log_if_op_disabled("Extensions.Enabled", conf.get_extensions_enabled())
+            log_if_op_disabled("AutoUpdate.Enabled", conf.get_autoupdate_enabled())
 
             if conf.enable_firewall():
                 log_if_int_changed_from_default("OS.EnableFirewallPeriod", conf.get_enable_firewall_period())
+
+            if conf.get_autoupdate_enabled():
+                log_if_int_changed_from_default("Autoupdate.Frequency", conf.get_autoupdate_frequency())
 
             if conf.get_lib_dir() != "/var/lib/waagent":
                 log_event("lib dir is in an unexpected location: {0}".format(conf.get_lib_dir()))
