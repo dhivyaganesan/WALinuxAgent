@@ -159,7 +159,7 @@ __STRING_OPTIONS__ = {
     "ResourceDisk.MountOptions": None,
     "ResourceDisk.Filesystem": "ext3",
     "AutoUpdate.GAFamily": "Prod",
-    "Debug.CgroupMonitorExpiryTime": "2021-11-30",
+    "Debug.CgroupMonitorExpiryTime": "2022-01-31",
     "Debug.CgroupMonitorExtensionName": "Microsoft.Azure.Monitor.AzureMonitorLinuxAgent",
 }
 
@@ -185,7 +185,9 @@ __INTEGER_OPTIONS__ = {
     #
     "Debug.CgroupCheckPeriod": 300,
     "Debug.AgentCpuQuota": 75,
-    "Debug.EtpCollectionPeriod": 300
+    "Debug.EtpCollectionPeriod": 300,
+    "Debug.AutoUpdateHotfixFrequency": 14400,
+    "Debug.AutoUpdateNormalFrequency": 86400
 }
 
 
@@ -551,7 +553,7 @@ def get_cgroup_monitor_expiry_time (conf=__conf__):
 
     NOTE: This option is experimental and may be removed in later versions of the Agent.
     """
-    return conf.get("Debug.CgroupMonitorExpiryTime", "2021-11-30")
+    return conf.get("Debug.CgroupMonitorExpiryTime", "2022-01-31")
 
 def get_cgroup_monitor_extension_name (conf=__conf__):
     """
@@ -577,3 +579,19 @@ def get_etp_collection_period(conf=__conf__):
     NOTE: This option is experimental and may be removed in later versions of the Agent.
     """
     return conf.get_int("Debug.EtpCollectionPeriod", 300)
+
+
+def get_hotfix_upgrade_frequency(conf=__conf__):
+    """
+    Determines the frequency to check for Hotfix upgrades (<Patch>.<Build> version changed in new upgrades).
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_int("Debug.AutoUpdateHotfixFrequency", 4 * 60 * 60)
+
+
+def get_normal_upgrade_frequency(conf=__conf__):
+    """
+    Determines the frequency to check for Normal upgrades (<Major>.<Minor> version changed in new upgrades).
+    NOTE: This option is experimental and may be removed in later versions of the Agent.
+    """
+    return conf.get_int("Debug.AutoUpdateNormalFrequency", 24 * 60 * 60)
