@@ -48,7 +48,10 @@ from azurelinuxagent.common.future import ustr
 from azurelinuxagent.common.osutil import get_osutil, systemd
 from azurelinuxagent.common.protocol.util import get_protocol_util
 from azurelinuxagent.common.protocol.hostplugin import HostPluginProtocol
+from azurelinuxagent.common.utils import shellutil
 from azurelinuxagent.common.utils.flexible_version import FlexibleVersion
+from azurelinuxagent.common.utils.networkutil import AddFirewallRules
+from azurelinuxagent.common.utils.shellutil import CommandError
 from azurelinuxagent.common.version import AGENT_NAME, AGENT_VERSION, AGENT_DIR_PATTERN, CURRENT_AGENT,\
     CURRENT_VERSION, DISTRO_NAME, DISTRO_VERSION, is_current_agent_installed, get_lis_version, \
     has_logrotate, PY_VERSION_MAJOR, PY_VERSION_MINOR, PY_VERSION_MICRO
@@ -60,6 +63,8 @@ from azurelinuxagent.ga.exthandlers import HandlerManifest, ExtHandlersHandler, 
 from azurelinuxagent.ga.monitor import get_monitor_handler
 
 from azurelinuxagent.ga.send_telemetry_events import get_send_telemetry_events_handler
+from azurelinuxagent.common.osutil.default import get_firewall_drop_command, \
+    get_accept_tcp_rule
 
 AGENT_ERROR_FILE = "error.json"  # File name for agent error record
 AGENT_MANIFEST_FILE = "HandlerManifest.json"
@@ -358,6 +363,7 @@ class UpdateHandler(object):
             self._ensure_cgroups_initialized()
             self._ensure_extension_telemetry_state_configured_properly(protocol)
             self._ensure_firewall_rules_persisted(dst_ip=protocol.get_endpoint())
+            self._add_accept_tcp_firewall_rule_if_not_enabled(dst_ip=protocol.get_endpoint())
 
             # Get all thread handlers
             telemetry_handler = get_send_telemetry_events_handler(self.protocol_util)
@@ -453,7 +459,15 @@ class UpdateHandler(object):
             if available_agent is None:
                 raise AgentUpgradeExitException("Agent {0} is reverting to the installed agent -- exiting".format(CURRENT_AGENT))
             else:
-                logger.info("Discovered new Agent {0}".format(available_agent.name))
+                next_normal_time, next_hotfix_time = self.__get_next_upgrade_times()
+                upgrade_type = self.__get_agent_upgrade_type(available_agent)
+                next_time = next_hotfix_time if upgrade_type == AgentUpgradeType.Hotfix else next_normal_time
+                message = "Discovered new {0} upgrade {1}; Will upgrade on or after {2}".format(
+                    upgrade_type, available_agent.name,
+                    datetime.utcfromtimestamp(next_time).strftime(logger.Logger.LogTimeFormatInUTC))
+                add_event(AGENT_NAME, op=WALAEventOperation.AgentUpgrade, version=CURRENT_VERSION, is_success=True,
+                          message=message, log_event=False)
+                logger.info(message)
 
         self.__upgrade_agent_if_permitted()
 
@@ -1009,10 +1023,57 @@ class UpdateHandler(object):
             message=msg,
             log_event=False)
 
-    def __upgrade_agent_if_permitted(self):
+    def _add_accept_tcp_firewall_rule_if_not_enabled(self, dst_ip):
+
+        def _execute_run_command(command):
+            # Helper to execute a run command, returns True if no exception
+            # Here we primarily check if an  iptable rule exist. True if it exits , false if not
+            try:
+                shellutil.run_command(command)
+                return True
+            except CommandError as err:
+                # return code 1 is expected while using the check command. Raise if encounter any other return code
+                if err.returncode != 1:
+                    raise
+            return False
+
+        try:
+            wait = self.osutil.get_firewall_will_wait()
+
+            # "-C" checks if the iptable rule is available in the chain. It throws an exception with return code 1 if the ip table rule doesnt exist
+            drop_rule = get_firewall_drop_command(wait, AddFirewallRules.CHECK_COMMAND, dst_ip)
+            if not _execute_run_command(drop_rule):
+                # DROP command doesn't exist indicates then none of the firewall rules are set yet
+                # exiting here as the environment thread will set up all firewall rules
+                logger.info("DROP rule is not available which implies no firewall rules are set yet. Environment thread will set it up.")
+                return
+            else:
+                # DROP rule exists in the ip table chain. Hence checking if the DNS TCP to wireserver rule exists. If not we add it.
+                accept_tcp_rule = get_accept_tcp_rule(wait, AddFirewallRules.CHECK_COMMAND, dst_ip)
+                if not _execute_run_command(accept_tcp_rule):
+                    try:
+                        logger.info(
+                            "Firewall rule to allow DNS TCP request to wireserver for a non root user unavailable. Setting it now.")
+                        accept_tcp_rule = get_accept_tcp_rule(wait, AddFirewallRules.INSERT_COMMAND, dst_ip)
+                        shellutil.run_command(accept_tcp_rule)
+                        logger.info(
+                            "Succesfully added firewall rule to allow non root users to do a DNS TCP request to wireserver")
+                    except CommandError as error:
+                        msg = "Unable to set the non root tcp access firewall rule :" \
+                              "Run command execution for {0} failed with error:{1}.Return Code:{2}"\
+                            .format(error.command, error.stderr, error.returncode)
+                        logger.error(msg)
+                else:
+                    logger.info(
+                        "Not setting the firewall rule to allow DNS TCP request to wireserver for a non root user since it already exists")
+        except Exception as e:
+            msg = "Error while checking ip table rules:{0}".format(ustr(e))
+            logger.error(msg)
+
+    def __get_next_upgrade_times(self):
         """
-        Check every 4hrs for a Hotfix Upgrade and 24 hours for a Normal upgrade and upgrade the agent if available.
-        raises: ExitException when a new upgrade is available in the relevant time window, else returns
+        Get the next upgrade times
+        return: Next Normal Upgrade Time, Next Hotfix Upgrade Time
         """
 
         def get_next_process_time(last_val, frequency):
@@ -1022,6 +1083,24 @@ class UpdateHandler(object):
         next_hotfix_time = get_next_process_time(self._last_hotfix_upgrade_time, conf.get_hotfix_upgrade_frequency())
         next_normal_time = get_next_process_time(self._last_normal_upgrade_time, conf.get_normal_upgrade_frequency())
 
+        return next_normal_time, next_hotfix_time
+
+    @staticmethod
+    def __get_agent_upgrade_type(available_agent):
+        # We follow semantic versioning for the agent, if <Major>.<Minor> is same, then <Patch>.<Build> has changed.
+        # In this case, we consider it as a Hotfix upgrade. Else we consider it a Normal upgrade.
+        if available_agent.version.major == CURRENT_VERSION.major and available_agent.version.minor == CURRENT_VERSION.minor:
+            return AgentUpgradeType.Hotfix
+        return AgentUpgradeType.Normal
+
+    def __upgrade_agent_if_permitted(self):
+        """
+        Check every 4hrs for a Hotfix Upgrade and 24 hours for a Normal upgrade and upgrade the agent if available.
+        raises: ExitException when a new upgrade is available in the relevant time window, else returns
+        """
+
+        next_normal_time, next_hotfix_time = self.__get_next_upgrade_times()
+        now = time.time()
         # Not permitted to update yet for any of the AgentUpgradeModes
         if next_hotfix_time > now and next_normal_time > now:
             return
@@ -1035,28 +1114,13 @@ class UpdateHandler(object):
             logger.verbose("No agent upgrade discovered")
             return
 
-        # We follow semantic versioning for the agent, if <Major>.<Minor> is same, then <Patch>.<Build> has changed.
-        # In this case, we consider it as a Hotfix upgrade. Else we consider it a Normal upgrade.
-        is_hotfix_upgrade = available_agent.version.major == CURRENT_VERSION.major and available_agent.version.minor == CURRENT_VERSION.minor
-        upgrade_message = "{0} Agent upgrade discovered, updating to {1} -- exiting"
+        upgrade_type = self.__get_agent_upgrade_type(available_agent)
+        upgrade_message = "{0} Agent upgrade discovered, updating to {1} -- exiting".format(upgrade_type,
+                                                                                            available_agent.name)
 
-        if is_hotfix_upgrade and next_hotfix_time <= now:
-            raise AgentUpgradeExitException(upgrade_message.format(AgentUpgradeType.Hotfix, available_agent.name))
-        elif (not is_hotfix_upgrade) and next_normal_time <= now:
-            raise AgentUpgradeExitException(upgrade_message.format(AgentUpgradeType.Normal, available_agent.name))
-
-        # Not upgrading the agent as the times don't match for their relevant upgrade, logging it appropriately
-        if is_hotfix_upgrade:
-            upgrade_type, next_time = AgentUpgradeType.Hotfix, next_hotfix_time
-        else:
-            upgrade_type, next_time = AgentUpgradeType.Normal, next_normal_time
-
-        message = "Discovered new {0} upgrade {1}; Will upgrade on or after {2}".format(
-            upgrade_type, available_agent.name,
-            datetime.utcfromtimestamp(next_time).strftime(logger.Logger.LogTimeFormatInUTC))
-        add_event(AGENT_NAME, op=WALAEventOperation.AgentUpgrade, version=CURRENT_VERSION, is_success=False,
-                  message=message, log_event=False)
-        logger.info(message)
+        if (upgrade_type == AgentUpgradeType.Hotfix and next_hotfix_time <= now) or (
+                upgrade_type == AgentUpgradeType.Normal and next_normal_time <= now):
+            raise AgentUpgradeExitException(upgrade_message)
 
 
 class GuestAgent(object):
@@ -1364,8 +1428,20 @@ class GuestAgentError(object):
 
     def load(self):
         if self.path is not None and os.path.isfile(self.path):
-            with open(self.path, 'r') as f:
-                self.from_json(json.load(f))
+            try:
+                with open(self.path, 'r') as f:
+                    self.from_json(json.load(f))
+            except Exception as error:
+                # The error.json file is only supposed to be written only by the agent.
+                # If for whatever reason the file is malformed, just delete it to reset state of the errors.
+                logger.warn(
+                    "Ran into error when trying to load error file {0}, deleting it to clean state. Error: {1}".format(
+                        self.path, textutil.format_exception(error)))
+                try:
+                    os.remove(self.path)
+                except Exception:
+                    # We try best case efforts to delete the file, ignore error if we're unable to do so
+                    pass
         return
 
     def save(self):

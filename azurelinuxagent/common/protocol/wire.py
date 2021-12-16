@@ -135,13 +135,6 @@ class WireProtocol(DataContract):
         valid_pkg_list = ga_manifest.pkg_list
         return valid_pkg_list
 
-    def get_ext_handlers(self):
-        logger.verbose("Get extension handler config")
-        goal_state = self.client.get_goal_state()
-        extensions_goal_state = self.client.get_extensions_goal_state()
-        # In wire protocol, incarnation is equivalent to ETag
-        return extensions_goal_state.ext_handlers, goal_state.incarnation
-
     def get_ext_handler_pkgs(self, ext_handler):
         logger.verbose("Get extension handler package")
         man = self.client.get_ext_manifest(ext_handler)
@@ -713,11 +706,13 @@ class WireClient(object):
         """
         logger.verbose("Fetch [{0}] with headers [{1}]", uri, headers)
         content = None
+        response_headers = None
         response = self._fetch_response(uri, headers, use_proxy, max_retry=max_retry, ok_codes=ok_codes)
         if response is not None and not restutil.request_failed(response, ok_codes=ok_codes):
             response_content = response.read()
             content = self.decode_config(response_content) if decode else response_content
-        return content, response.getheaders()
+            response_headers = response.getheaders()
+        return content, response_headers
 
     def _fetch_response(self, uri, headers=None, use_proxy=None, max_retry=None, ok_codes=None):
         """
@@ -967,7 +962,7 @@ class WireClient(object):
             raise ProtocolError("Trying to fetch Extension Manifest before initialization!")
 
         try:
-            xml_text = self.fetch_manifest(ext_handler.versionUris)
+            xml_text = self.fetch_manifest(ext_handler.manifest_uris)
             self._save_cache(xml_text, MANIFEST_FILE_NAME.format(ext_handler.name, self.get_goal_state().incarnation))
             return ExtensionManifest(xml_text)
         except Exception as e:
